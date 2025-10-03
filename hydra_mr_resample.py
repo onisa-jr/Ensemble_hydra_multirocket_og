@@ -78,53 +78,53 @@ def fit_transformers(X_sample, n_features, size_mb):
 def process_dataset(folder, dataset, resample_id, model_dir):
     # Set random seed for reproducibility
     np.random.seed(resample_id)
-    
+
     # Setup model directory and check if model exists
     dataset_model_dir = os.path.join(model_dir, dataset)
     model_file = os.path.join(dataset_model_dir, "clf.pkl")
     os.makedirs(dataset_model_dir, exist_ok=True)
     if os.path.exists(model_file):
         return None
-    
+
     # Load train and test data
     train_file = os.path.join(folder, dataset, f"{dataset}_TRAIN.tsv")
     test_file = os.path.join(folder, dataset, f"{dataset}_TEST.tsv")
     train_df = pd.read_csv(train_file, sep="\t", header=None)
     test_df = pd.read_csv(test_file, sep="\t", header=None)
-    
+
     # Combine and shuffle data
     full_df = pd.concat([train_df, test_df], ignore_index=True)
     full_df = full_df.sample(frac=1, random_state=resample_id).reset_index(drop=True)
-    
+
     # Split back into train and test sets
     n_train, n_test = len(train_df), len(test_df)
     train_df = full_df.iloc[:n_train].reset_index(drop=True)
     test_df = full_df.iloc[n_train:n_train + n_test].reset_index(drop=True)
-    
+
     # Prepare feature and label arrays
     y_train = train_df.iloc[:, 0].values
     X_train = train_df.iloc[:, 1:].values.reshape(train_df.shape[0], 1, train_df.shape[1] - 1)
     y_test = test_df.iloc[:, 0].values
     X_test = test_df.iloc[:, 1:].values.reshape(test_df.shape[0], 1, test_df.shape[1] - 1)
-    
+
     # Fit transformers and classifier on a sample
     train_size, _, n_features = dataset_info(folder, dataset)
     multirocket, hydra, scaler_std, scaler_hydra, X_fit = fit_transformers(
         X_train[:50], n_features, train_size
     )
     clf = RidgeClassifier().fit(X_fit, y_train[:50])
-    
+
     # Transform and train on full training data
     Xt_hydra = scaler_hydra.transform(hydra.transform(X_train))
     Xt_multi = scaler_std.transform(multirocket.transform(X_train))
     clf.fit(np.concatenate([Xt_hydra, Xt_multi], axis=1), y_train)
-    
+
     # Transform and evaluate on test data
     Xt_hydra = scaler_hydra.transform(hydra.transform(X_test))
     Xt_multi = scaler_std.transform(multirocket.transform(X_test))
     X_test_features = np.concatenate([Xt_hydra, Xt_multi], axis=1)
     acc = accuracy_score(y_test, clf.predict(X_test_features))
-    
+
     # Save model
     joblib.dump({
         "clf": clf,
@@ -133,10 +133,10 @@ def process_dataset(folder, dataset, resample_id, model_dir):
         "scaler_std": scaler_std,
         "scaler_hydra": scaler_hydra
     }, model_file)
-    
+
     # Cleanup
     cleanup()
-    
+
     return acc
 
 
@@ -183,7 +183,8 @@ def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_
                 df.loc[df["Dataset"] == dataset, f"Resample_{r}"] = res_accs[-1]
                 df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = np.nanmean(res_accs)
             else:
-                row = {"Dataset": dataset, **{f"Resample_{i+1}": np.nan for i in range(n_resamples)}, "MeanAccuracy": np.nan}
+                row = {"Dataset": dataset, **{f"Resample_{i + 1}": np.nan for i in range(n_resamples)},
+                       "MeanAccuracy": np.nan}
                 row[f"Resample_{r}"] = res_accs[-1]
                 row["MeanAccuracy"] = np.nanmean(res_accs)
                 df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
@@ -201,6 +202,7 @@ def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_
         print("⚠️ No valid results")
 
     return df, final_mean
+
 
 if __name__ == "__main__":
     pass

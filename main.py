@@ -30,7 +30,7 @@ def update_results(df: pd.DataFrame, dataset: str, resample_id: int, acc: float,
         df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = np.nanmean(res_accs)
     else:
         row = {"Dataset": dataset,
-               **{f"Resample{i+1}": np.nan for i in range(len(res_accs))},
+               **{f"Resample{i + 1}": np.nan for i in range(len(res_accs))},
                "MeanAccuracy": np.nan}
         row[f"Resample{resample_id}"] = acc
         row["MeanAccuracy"] = np.nanmean(res_accs)
@@ -40,7 +40,7 @@ def update_results(df: pd.DataFrame, dataset: str, resample_id: int, acc: float,
 
 def run_experiments(dataset_folder: str, output_file: str, n_resamples: int):
     """Main loop to train RidgeNet across datasets and resamples."""
-    evaluate_all(dataset_folder) 
+    evaluate_all(dataset_folder)
 
     df, processed = load_existing_results(output_file, n_resamples)
 
