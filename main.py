@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from ridgenet import train_fld
-from hydra_mr_resample import evaluate_all, Config
+from hydra_mr_resamples import evaluate_all, Configs
 
 DATASET_FOLDER = "datasets"
 OUTPUT_FILE = "ridgenet.csv"
