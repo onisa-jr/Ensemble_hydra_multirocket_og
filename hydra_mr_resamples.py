@@ -227,7 +227,7 @@ def process_dataset_batch(datasets_batch, folder, resample_id, model_dir):
     return results
 
 
-def evaluate_all_parallel(folder, output_file=Config.output_file, 
+def evaluate_all(folder, output_file=Config.output_file, 
                          model_dir=Config.model_dir, n_resamples=Config.n_resamples):
     """Highly parallel evaluation using all available cores."""
     
@@ -314,13 +314,4 @@ def evaluate_all_parallel(folder, output_file=Config.output_file,
 
 
 if __name__ == "__main__":
-    # Example usage
-    data_folder = "path/to/your/ucr/data"  # Update this path
-    
-    print(f"💻 Starting parallel processing with {Config.n_jobs} cores")
-    print(f"💾 Available memory: {Config.max_memory_mb} MB")
-    
-    results_df, overall_mean = evaluate_all_parallel(data_folder)
-    
-    print(f"📊 Final results saved to {Config.output_file}")
-    print(f"🎯 Overall performance: {overall_mean:.4f}")
+    pass
