@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import joblib
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
@@ -17,7 +18,8 @@ class Config:
     n_resamples = 30
     output_file = "ucr_baseline_results_wide.csv"
     model_dir = "baseline_models_resamples"
-    n_jobs = 8  # Leave 1 thread for system
+    n_jobs_per_dataset = 2  # Threads per dataset
+    parallel_datasets = 4  # Process 4 datasets simultaneously
     checkpoint_interval = 3  # Save every 3 resamples
 
 
@@ -25,17 +27,17 @@ def get_transformer_params(n_samples, n_features):
     """Smart parameter selection based on dataset characteristics."""
     if n_samples > 5000 or n_features > 1000:
         return {
-            'mr': {'n_kernels': 5000, 'n_jobs': Config.n_jobs},
+            'mr': {'n_kernels': 5000, 'n_jobs': Config.n_jobs_per_dataset},
             'hydra': {'n_kernels': 4, 'n_groups': 32}
         }
     elif n_samples > 1000:
         return {
-            'mr': {'n_kernels': 8000, 'n_jobs': Config.n_jobs},
+            'mr': {'n_kernels': 8000, 'n_jobs': Config.n_jobs_per_dataset},
             'hydra': {'n_kernels': 6, 'n_groups': 48}
         }
     else:
         return {
-            'mr': {'n_kernels': 10000, 'n_jobs': Config.n_jobs},
+            'mr': {'n_kernels': 10000, 'n_jobs': Config.n_jobs_per_dataset},
             'hydra': {'n_kernels': 8, 'n_groups': 64}
         }
 
@@ -74,7 +76,7 @@ def process_resample(folder, dataset, resample_id, model_dir):
         try:
             model_data = joblib.load(model_file)
             if 'accuracy' in model_data:
-                return model_data['accuracy']
+                return resample_id, model_data['accuracy'], 'loaded'
         except:
             pass  # Recompute if loading fails
     
@@ -139,7 +141,19 @@ def process_resample(folder, dataset, resample_id, model_dir):
     del X_train, X_test, X_train_full, X_test_full
     gc.collect()
     
-    return accuracy
+    return resample_id, accuracy, 'computed'
+
+
+def process_dataset_resamples(args):
+    """Process all missing resamples for a single dataset."""
+    folder, dataset, missing_resamples, model_dir = args
+    
+    results = {}
+    for r in missing_resamples:
+        resample_id, acc, status = process_resample(folder, dataset, r, model_dir)
+        results[resample_id] = (acc, status)
+    
+    return dataset, results
 
 
 def check_and_compute_missing(df, folder, model_dir, n_resamples):
@@ -191,14 +205,14 @@ def check_and_compute_missing(df, folder, model_dir, n_resamples):
         return df, dataset_status
     
     print(f"\n🔧 Found {total_missing} missing resamples across {len([d for d, m in dataset_status.items() if m])} datasets")
-    print(f"⚡ Starting computation...\n")
+    print(f"⚡ Starting parallel computation ({Config.parallel_datasets} datasets at a time)...\n")
     
     return df, dataset_status
 
 
 def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_dir, 
                  n_resamples=Config.n_resamples):
-    """Optimized evaluation with granular resample-level tracking."""
+    """Optimized evaluation with parallel dataset processing."""
     
     resample_cols = [f"Resample_{i}" for i in range(1, n_resamples + 1)]
     
@@ -214,7 +228,7 @@ def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_
     df, dataset_status = check_and_compute_missing(df, folder, model_dir, n_resamples)
     
     # Filter to only datasets with missing resamples
-    datasets_to_process = [d for d, missing in dataset_status.items() if missing]
+    datasets_to_process = [(d, dataset_status[d]) for d in dataset_status if dataset_status[d]]
     
     if not datasets_to_process:
         print("\n🎉 Nothing to compute - all datasets complete!")
@@ -222,63 +236,59 @@ def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_
     
     print(f"\n{'='*70}")
     print(f"🚀 Processing {len(datasets_to_process)} datasets with missing resamples")
-    print(f"⚡ Using {Config.n_jobs} parallel threads")
+    print(f"⚡ Parallel processing: {Config.parallel_datasets} datasets × {Config.n_jobs_per_dataset} threads = {Config.parallel_datasets * Config.n_jobs_per_dataset} total threads")
     print(f"{'='*70}\n")
     
-    for dataset_idx, dataset in enumerate(datasets_to_process, 1):
-        missing_resamples = dataset_status[dataset]
+    # Prepare arguments for parallel processing
+    process_args = [
+        (folder, dataset, missing_resamples, model_dir)
+        for dataset, missing_resamples in datasets_to_process
+    ]
+    
+    # Process datasets in parallel batches
+    completed = 0
+    total = len(datasets_to_process)
+    
+    with ProcessPoolExecutor(max_workers=Config.parallel_datasets) as executor:
+        # Submit all tasks
+        future_to_dataset = {
+            executor.submit(process_dataset_resamples, args): args[1] 
+            for args in process_args
+        }
         
-        print(f"[{dataset_idx}/{len(datasets_to_process)}] 📊 Dataset: {dataset}")
-        print(f"   🎯 Computing {len(missing_resamples)} missing resamples: {missing_resamples}")
-        
-        for r in missing_resamples:
-            col = f"Resample_{r}"
+        # Process results as they complete
+        for future in as_completed(future_to_dataset):
+            dataset = future_to_dataset[future]
+            completed += 1
             
-            # Try loading from saved model first
-            model_file = os.path.join(model_dir, f"resample_{r}", dataset, "clf.pkl")
-            acc = None
-            
-            if os.path.exists(model_file):
-                try:
-                    model_data = joblib.load(model_file)
-                    acc = model_data.get('accuracy')
-                    if acc is not None:
-                        print(f"   📁 Resample {r}: Loaded from disk → {acc:.4f}")
-                except:
-                    pass
-            
-            # Compute if not available
-            if acc is None:
-                print(f"   ⚙️  Resample {r}: Computing...", end=' ', flush=True)
-                acc = process_resample(folder, dataset, r, model_dir)
-                print(f"✅ {acc:.4f}")
-            
-            # Update dataframe
-            df.loc[df['Dataset'] == dataset, col] = acc
-            
-            # Save checkpoint periodically
-            if missing_resamples.index(r) % Config.checkpoint_interval == 0 or r == missing_resamples[-1]:
-                # Recalculate mean accuracy
+            try:
+                dataset, results = future.result()
+                
+                print(f"[{completed}/{total}] ✅ {dataset} completed!")
+                
+                # Update dataframe with results
+                for resample_id, (acc, status) in results.items():
+                    col = f"Resample_{resample_id}"
+                    df.loc[df['Dataset'] == dataset, col] = acc
+                    
+                    symbol = "📁" if status == 'loaded' else "⚙️"
+                    print(f"   {symbol} Resample {resample_id}: {acc:.4f} ({status})")
+                
+                # Calculate mean accuracy
                 row = df[df['Dataset'] == dataset].iloc[0]
                 accuracies = [row[c] for c in resample_cols if not pd.isna(row[c])]
-                if accuracies:
-                    df.loc[df['Dataset'] == dataset, 'MeanAccuracy'] = np.mean(accuracies)
+                mean_acc = np.mean(accuracies) if accuracies else np.nan
+                df.loc[df['Dataset'] == dataset, 'MeanAccuracy'] = mean_acc
                 
+                print(f"   📈 Mean accuracy: {mean_acc:.4f}\n")
+                
+                # Save after each dataset completion
                 df.to_csv(output_file, index=False)
-                print(f"   💾 Checkpoint saved")
-        
-        # Final mean calculation for this dataset
-        row = df[df['Dataset'] == dataset].iloc[0]
-        accuracies = [row[c] for c in resample_cols if not pd.isna(row[c])]
-        mean_acc = np.mean(accuracies) if accuracies else np.nan
-        df.loc[df['Dataset'] == dataset, 'MeanAccuracy'] = mean_acc
-        
-        print(f"   📈 Dataset complete! Mean accuracy: {mean_acc:.4f}")
-        print(f"   {'─'*65}\n")
-        
-        # Save after each dataset
-        df.to_csv(output_file, index=False)
-        gc.collect()
+                
+            except Exception as e:
+                print(f"[{completed}/{total}] ❌ {dataset} failed: {e}\n")
+            
+            gc.collect()
     
     # Final save and statistics
     df.to_csv(output_file, index=False)
@@ -288,7 +298,7 @@ def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_
     print(f"{'='*70}")
     print(f"📊 Total datasets: {len(df)}")
     print(f"🎯 Datasets processed: {len(datasets_to_process)}")
-    print(f"🔢 Total resamples computed: {sum(len(m) for m in dataset_status.values() if m)}")
+    print(f"🔢 Total resamples computed: {sum(len(m) for _, m in datasets_to_process)}")
     
     complete_datasets = df['MeanAccuracy'].notna().sum()
     print(f"✓  Complete datasets: {complete_datasets}/{len(df)}")
@@ -297,7 +307,7 @@ def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_
         print(f"🏆 Overall mean accuracy: {df['MeanAccuracy'].mean():.4f}")
     
     print(f"💾 Results saved to: {output_file}")
-    final_mean = df['MeanAccuracy'].mean() if complete_datasets > 0 else None
+    final_mean = df["MeanAccuracy"].dropna().mean() if len(df) else None
     return df, final_mean
 
 
