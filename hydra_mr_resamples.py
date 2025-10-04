@@ -1,11 +1,9 @@
 import os
 import gc
-import psutil
 import numpy as np
 import pandas as pd
 import joblib
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
@@ -15,315 +13,292 @@ warnings.filterwarnings("ignore")
 
 
 class Config:
-    """Memory-optimized configuration for 45GB RAM, 9 threads"""
+    """Optimized configuration for 50GB RAM, 9 threads"""
     n_resamples = 30
-    max_workers = 6  # Reduced from 9 to leave memory headroom
-    max_memory_mb = 35000  # Leave 10GB for system
-    skip_large_mb = 5000   # More conservative threshold
-    skip_large_features = 20000  # Reduced threshold
     output_file = "ucr_baseline_results_wide.csv"
     model_dir = "baseline_models_resamples"
-    
-    # Memory optimizations
-    use_parallel = True
-    batch_size = 3  # Process datasets in smaller batches
-    chunk_processing = True  # Enable chunking for large datasets
-    memory_monitor = True  # Monitor memory usage
+    n_jobs = 8  # Leave 1 thread for system
+    checkpoint_interval = 3  # Save every 3 resamples
 
 
-def memory_usage_mb():
-    """Return current memory usage in MB."""
-    return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
-
-
-def memory_safe_cleanup():
-    """Memory-aware garbage collection."""
-    gc.collect()
-    if memory_usage_mb() > Config.max_memory_mb * 0.8:  # If using >80% memory
-        print(f"⚠️  High memory usage: {memory_usage_mb():.0f}MB, forcing cleanup")
-        gc.collect()
-        gc.collect()
-
-
-def dataset_info(folder, name):
-    """Return (train_size_mb, test_size_mb, n_features)."""
-    train_file = os.path.join(folder, name, f"{name}_TRAIN.tsv")
-    test_file = os.path.join(folder, name, f"{name}_TEST.tsv")
-
-    train_size = os.path.getsize(train_file) / (1024 * 1024) if os.path.exists(train_file) else 0
-    test_size = os.path.getsize(test_file) / (1024 * 1024) if os.path.exists(test_file) else 0
-
-    if train_size > 0:
-        sample = pd.read_csv(train_file, sep="\t", header=None, nrows=1)
-        n_features = sample.shape[1] - 1
+def get_transformer_params(n_samples, n_features):
+    """Smart parameter selection based on dataset characteristics."""
+    if n_samples > 5000 or n_features > 1000:
+        return {
+            'mr': {'n_kernels': 5000, 'n_jobs': Config.n_jobs},
+            'hydra': {'n_kernels': 4, 'n_groups': 32}
+        }
+    elif n_samples > 1000:
+        return {
+            'mr': {'n_kernels': 8000, 'n_jobs': Config.n_jobs},
+            'hydra': {'n_kernels': 6, 'n_groups': 48}
+        }
     else:
-        n_features = 0
+        return {
+            'mr': {'n_kernels': 10000, 'n_jobs': Config.n_jobs},
+            'hydra': {'n_kernels': 8, 'n_groups': 64}
+        }
 
-    return train_size, test_size, n_features
 
-
-def fit_transformers_memory_safe(X_sample, n_features, size_mb):
-    """
-    Fit Hydra and MultiRocket with memory-conscious parameters.
-    """
-    # More conservative parameters to save memory
-    if size_mb > 2000:
-        # Very large datasets - very conservative
-        multirocket = MultiRocket(n_kernels=500, n_jobs=1, random_state=42)
-        hydra = HydraTransformer(n_kernels=2, n_groups=16, random_state=42)
-    elif size_mb > 1000:
-        # Large datasets - conservative
-        multirocket = MultiRocket(n_kernels=1000, n_jobs=2, random_state=42)
-        hydra = HydraTransformer(n_kernels=4, n_groups=32, random_state=42)
-    elif size_mb > 500:
-        # Medium datasets - balanced
-        multirocket = MultiRocket(n_kernels=2000, n_jobs=3, random_state=42)
-        hydra = HydraTransformer(n_kernels=8, n_groups=64, random_state=42)
-    else:
-        # Small datasets - can be more aggressive
-        multirocket = MultiRocket(n_kernels=5000, n_jobs=4, random_state=42)
-        hydra = HydraTransformer(n_kernels=16, n_groups=128, random_state=42)
-
-    scaler_std, scaler_hydra = StandardScaler(), StandardScaler()
+def load_and_resample(train_file, test_file, resample_id):
+    """Load, combine, shuffle, and split data in one pass."""
+    train_df = pd.read_csv(train_file, sep="\t", header=None)
+    test_df = pd.read_csv(test_file, sep="\t", header=None)
     
-    # Process one transformer at a time to reduce peak memory
-    Xt_hydra = scaler_hydra.fit_transform(hydra.fit_transform(X_sample))
-    memory_safe_cleanup()
+    n_train = len(train_df)
+    full_df = pd.concat([train_df, test_df], ignore_index=True)
+    full_df = full_df.sample(frac=1, random_state=resample_id).reset_index(drop=True)
     
-    Xt_multi = scaler_std.fit_transform(multirocket.fit_transform(X_sample))
-    memory_safe_cleanup()
+    train_resampled = full_df.iloc[:n_train]
+    test_resampled = full_df.iloc[n_train:]
     
-    features = np.concatenate([Xt_hydra, Xt_multi], axis=1)
-
-    return multirocket, hydra, scaler_std, scaler_hydra, features
-
-
-def process_large_data_in_chunks(X_data, transformer, scaler, chunk_size=1000):
-    """Process large datasets in chunks to avoid memory spikes."""
-    if len(X_data) <= chunk_size:
-        return scaler.transform(transformer.transform(X_data))
+    # Extract and reshape in one step
+    y_train = train_resampled.iloc[:, 0].values
+    X_train = train_resampled.iloc[:, 1:].values[:, np.newaxis, :]
+    y_test = test_resampled.iloc[:, 0].values
+    X_test = test_resampled.iloc[:, 1:].values[:, np.newaxis, :]
     
-    results = []
-    for i in range(0, len(X_data), chunk_size):
-        chunk = X_data[i:i + chunk_size]
-        transformed_chunk = scaler.transform(transformer.transform(chunk))
-        results.append(transformed_chunk)
-        memory_safe_cleanup()
-    
-    return np.vstack(results)
+    return X_train, y_train, X_test, y_test
 
 
-def process_dataset_resample(args):
-    """
-    Memory-optimized version for parallel execution.
-    """
-    folder, dataset, resample_id, model_dir = args
-    
-    # Check memory before starting
-    if memory_usage_mb() > Config.max_memory_mb * 0.9:
-        print(f"⚠️  High memory before {dataset}, waiting...")
-        memory_safe_cleanup()
-    
-    # Set random seed for reproducibility
+def process_resample(folder, dataset, resample_id, model_dir):
+    """Process a single resample: train and evaluate."""
     np.random.seed(resample_id)
-
-    # Setup model directory and check if model exists
-    dataset_model_dir = os.path.join(model_dir, dataset)
-    model_file = os.path.join(dataset_model_dir, "clf.pkl")
-    os.makedirs(dataset_model_dir, exist_ok=True)
+    
+    # Check if already computed
+    resample_dir = os.path.join(model_dir, f"resample_{resample_id}", dataset)
+    model_file = os.path.join(resample_dir, "clf.pkl")
     
     if os.path.exists(model_file):
-        return (dataset, resample_id, None)
-
-    try:
-        # Load train and test data
-        train_file = os.path.join(folder, dataset, f"{dataset}_TRAIN.tsv")
-        test_file = os.path.join(folder, dataset, f"{dataset}_TEST.tsv")
-        train_df = pd.read_csv(train_file, sep="\t", header=None)
-        test_df = pd.read_csv(test_file, sep="\t", header=None)
-
-        # Combine and shuffle data
-        full_df = pd.concat([train_df, test_df], ignore_index=True)
-        full_df = full_df.sample(frac=1, random_state=resample_id).reset_index(drop=True)
-
-        # Split back into train and test sets
-        n_train, n_test = len(train_df), len(test_df)
-        train_df = full_df.iloc[:n_train].reset_index(drop=True)
-        test_df = full_df.iloc[n_train:n_train + n_test].reset_index(drop=True)
-
-        # Prepare feature and label arrays
-        y_train = train_df.iloc[:, 0].values
-        X_train = train_df.iloc[:, 1:].values.reshape(train_df.shape[0], 1, train_df.shape[1] - 1)
-        y_test = test_df.iloc[:, 0].values
-        X_test = test_df.iloc[:, 1:].values.reshape(test_df.shape[0], 1, test_df.shape[1] - 1)
-
-        # Fit transformers and classifier on a sample
-        train_size, _, n_features = dataset_info(folder, dataset)
-        sample_size = min(50, len(X_train))  # Reduced sample size for memory
-        multirocket, hydra, scaler_std, scaler_hydra, X_fit = fit_transformers_memory_safe(
-            X_train[:sample_size], n_features, train_size
-        )
-        
-        # Use simpler classifier for initial fit
-        clf = RidgeClassifier(alpha=1.0, solver='sparse_cg')  # Memory-efficient solver
-        clf.fit(X_fit, y_train[:sample_size])
-        memory_safe_cleanup()
-
-        # Transform training data with chunking if large
-        if len(X_train) > 1000 and Config.chunk_processing:
-            Xt_hydra = process_large_data_in_chunks(X_train, hydra, scaler_hydra)
-            memory_safe_cleanup()
-            Xt_multi = process_large_data_in_chunks(X_train, multirocket, scaler_std)
-            memory_safe_cleanup()
-        else:
-            Xt_hydra = scaler_hydra.transform(hydra.transform(X_train))
-            memory_safe_cleanup()
-            Xt_multi = scaler_std.transform(multirocket.transform(X_train))
-            memory_safe_cleanup()
-        
-        X_train_features = np.concatenate([Xt_hydra, Xt_multi], axis=1)
-        
-        # Fit final classifier
-        clf.fit(X_train_features, y_train)
-        memory_safe_cleanup()
-
-        # Transform test data
-        if len(X_test) > 1000 and Config.chunk_processing:
-            Xt_hydra_test = process_large_data_in_chunks(X_test, hydra, scaler_hydra)
-            Xt_multi_test = process_large_data_in_chunks(X_test, multirocket, scaler_std)
-        else:
-            Xt_hydra_test = scaler_hydra.transform(hydra.transform(X_test))
-            Xt_multi_test = scaler_std.transform(multirocket.transform(X_test))
-        
-        X_test_features = np.concatenate([Xt_hydra_test, Xt_multi_test], axis=1)
-        acc = accuracy_score(y_test, clf.predict(X_test_features))
-
-        # Save model with compression
-        joblib.dump({
-            "clf": clf,
-            "hydra": hydra,
-            "multirocket": multirocket,
-            "scaler_std": scaler_std,
-            "scaler_hydra": scaler_hydra
-        }, model_file, compress=3)
-
-        memory_safe_cleanup()
-        return (dataset, resample_id, acc)
+        # Load existing accuracy
+        try:
+            model_data = joblib.load(model_file)
+            if 'accuracy' in model_data:
+                return model_data['accuracy']
+        except:
+            pass  # Recompute if loading fails
     
-    except Exception as e:
-        print(f"❌ Error processing {dataset} resample {resample_id}: {str(e)}")
-        memory_safe_cleanup()
-        return (dataset, resample_id, np.nan)
-
-
-def evaluate_all_memory_safe(folder, output_file=Config.output_file, model_dir=Config.model_dir, 
-                            n_resamples=Config.n_resamples, max_workers=Config.max_workers):
-    """
-    Memory-safe parallel evaluation with batching and monitoring.
-    """
-    # Load or create results table
-    if os.path.exists(output_file):
-        df = pd.read_csv(output_file)
-        processed = set(df["Dataset"].tolist())
-        print(f"📂 Resuming from existing results: {len(processed)} datasets already done")
-    else:
-        cols = ["Dataset"] + [f"Resample_{i}" for i in range(1, n_resamples + 1)] + ["MeanAccuracy"]
-        df, processed = pd.DataFrame(columns=cols), set()
-        print(f"📂 Starting fresh run, output will be saved to {output_file}")
-
-    # Get all datasets
-    datasets = [d for d in os.listdir(folder) if os.path.isdir(os.path.join(folder, d))]
-    datasets = [d for d in datasets if d not in processed]
+    # Load data
+    train_file = os.path.join(folder, dataset, f"{dataset}_TRAIN.tsv")
+    test_file = os.path.join(folder, dataset, f"{dataset}_TEST.tsv")
+    X_train, y_train, X_test, y_test = load_and_resample(train_file, test_file, resample_id)
     
-    if not datasets:
-        print("✅ All datasets already processed!")
-        return df, df["MeanAccuracy"].dropna().mean() if len(df) else None
-
-    # Sort datasets by size (smallest first)
-    datasets.sort(key=lambda d: sum(dataset_info(folder, d)[:2]))
-
-    print(f"🚀 Processing {len(datasets)} datasets with {max_workers} workers (memory-safe)")
-    print(f"💾 Memory limit: {Config.max_memory_mb}MB | Batch size: {Config.batch_size}")
-    print(f"📊 Current memory: {memory_usage_mb():.0f}MB")
-
-    # Process datasets in smaller batches to control memory
-    batch_size = Config.batch_size
-    all_tasks = []
+    # Get optimal parameters
+    params = get_transformer_params(X_train.shape[0], X_train.shape[2])
     
-    for dataset in datasets:
+    # Initialize transformers
+    multirocket = MultiRocket(random_state=42, **params['mr'])
+    hydra = HydraTransformer(random_state=42, **params['hydra'])
+    
+    # Fit on sample for speed
+    sample_size = min(100, len(X_train))
+    X_sample = X_train[:sample_size]
+    y_sample = y_train[:sample_size]
+    
+    # Transform pipeline
+    hydra_features = hydra.fit_transform(X_sample)
+    mr_features = multirocket.fit_transform(X_sample)
+    
+    scaler_hydra = StandardScaler().fit(hydra_features)
+    scaler_mr = StandardScaler().fit(mr_features)
+    
+    X_sample_scaled = np.hstack([
+        scaler_hydra.transform(hydra_features),
+        scaler_mr.transform(mr_features)
+    ])
+    
+    # Train classifier
+    clf = RidgeClassifier(random_state=42).fit(X_sample_scaled, y_sample)
+    
+    # Full training
+    X_train_hydra = scaler_hydra.transform(hydra.transform(X_train))
+    X_train_mr = scaler_mr.transform(multirocket.transform(X_train))
+    X_train_full = np.hstack([X_train_hydra, X_train_mr])
+    clf.fit(X_train_full, y_train)
+    
+    # Evaluate
+    X_test_hydra = scaler_hydra.transform(hydra.transform(X_test))
+    X_test_mr = scaler_mr.transform(multirocket.transform(X_test))
+    X_test_full = np.hstack([X_test_hydra, X_test_mr])
+    
+    y_pred = clf.predict(X_test_full)
+    accuracy = accuracy_score(y_test, y_pred)
+    
+    # Save model with accuracy
+    os.makedirs(resample_dir, exist_ok=True)
+    joblib.dump({
+        'clf': clf,
+        'hydra': hydra,
+        'multirocket': multirocket,
+        'scaler_hydra': scaler_hydra,
+        'scaler_mr': scaler_mr,
+        'accuracy': accuracy
+    }, model_file)
+    
+    # Cleanup
+    del X_train, X_test, X_train_full, X_test_full
+    gc.collect()
+    
+    return accuracy
+
+
+def check_and_compute_missing(df, folder, model_dir, n_resamples):
+    """Check every single resample for every dataset and compute missing ones."""
+    resample_cols = [f"Resample_{i}" for i in range(1, n_resamples + 1)]
+    
+    # Get all datasets from folder
+    all_datasets = sorted([d for d in os.listdir(folder) 
+                          if os.path.isdir(os.path.join(folder, d))])
+    
+    # Add missing datasets to dataframe
+    existing_datasets = set(df['Dataset'].tolist()) if len(df) > 0 else set()
+    new_datasets = set(all_datasets) - existing_datasets
+    
+    if new_datasets:
+        print(f"📝 Adding {len(new_datasets)} new datasets to tracking")
+        for dataset in new_datasets:
+            new_row = {'Dataset': dataset}
+            for col in resample_cols:
+                new_row[col] = np.nan
+            new_row['MeanAccuracy'] = np.nan
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    
+    # Now check EVERY resample for EVERY dataset
+    total_missing = 0
+    dataset_status = {}
+    
+    print(f"\n🔍 Scanning all {len(df)} datasets × {n_resamples} resamples...")
+    
+    for idx, row in df.iterrows():
+        dataset = row['Dataset']
+        missing_resamples = []
+        
         for r in range(1, n_resamples + 1):
-            resample_model_dir = os.path.join(model_dir, f"resample_{r}")
-            all_tasks.append((folder, dataset, r, resample_model_dir))
-
-    print(f"📋 Total tasks: {len(all_tasks)} | Processing in batches of {batch_size * n_resamples}")
-
-    # Process in batches
-    completed_tasks = 0
-    total_tasks = len(all_tasks)
+            col = f"Resample_{r}"
+            if pd.isna(row[col]):
+                missing_resamples.append(r)
+                total_missing += 1
+        
+        dataset_status[dataset] = missing_resamples
+        
+        if missing_resamples:
+            print(f"   ⚠️  {dataset}: Missing {len(missing_resamples)} resamples {missing_resamples[:5]}{'...' if len(missing_resamples) > 5 else ''}")
+        else:
+            print(f"   ✅ {dataset}: Complete ({n_resamples}/{n_resamples})")
     
-    for batch_start in range(0, total_tasks, batch_size * n_resamples):
-        batch_end = min(batch_start + (batch_size * n_resamples), total_tasks)
-        current_batch = all_tasks[batch_start:batch_end]
-        
-        batch_datasets = set(task[1] for task in current_batch)
-        print(f"\n🔄 Processing batch: {', '.join(batch_datasets)}")
-        print(f"📦 Batch tasks: {len(current_batch)} | Memory: {memory_usage_mb():.0f}MB")
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_task = {executor.submit(process_dataset_resample, task): task for task in current_batch}
-            
-            for future in as_completed(future_to_task):
-                dataset, resample_id, acc = future.result()
-                completed_tasks += 1
-                
-                # Update results
-                if dataset in df["Dataset"].values:
-                    df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
-                    resample_cols = [f"Resample_{i}" for i in range(1, n_resamples + 1)]
-                    current_accs = df.loc[df["Dataset"] == dataset, resample_cols].values[0]
-                    df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = np.nanmean(current_accs)
-                else:
-                    row = {"Dataset": dataset, **{f"Resample_{i}": np.nan for i in range(1, n_resamples + 1)}}
-                    row[f"Resample_{resample_id}"] = acc
-                    row["MeanAccuracy"] = acc if acc is not None else np.nan
-                    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-                
-                status = f"✅ {acc:.4f}" if acc is not None else "⚠️  Exists"
-                print(f"   {dataset} R{resample_id}: {status} [{completed_tasks}/{total_tasks}]")
-                
-                # Save progress
-                if completed_tasks % 5 == 0:
-                    df.to_csv(output_file, index=False)
-                    if Config.memory_monitor:
-                        print(f"💾 Memory check: {memory_usage_mb():.0f}MB")
-        
-        # Force cleanup between batches
-        print("🧹 Cleaning up between batches...")
-        memory_safe_cleanup()
-        
-        # Save batch results
-        df.to_csv(output_file, index=False)
+    if total_missing == 0:
+        print(f"\n✨ All datasets complete! Total: {len(df)} datasets × {n_resamples} resamples")
+        return df, dataset_status
     
-    # Final save and summary
-    final_mean = df["MeanAccuracy"].dropna().mean() if len(df) else None
-    print("\n" + "="*60)
-    print("✅ All datasets complete!")
-    if final_mean is not None:
-        print(f"🏆 Overall Mean Accuracy: {final_mean:.4f}")
-    else:
-        print("⚠️ No valid results")
-    print(f"💾 Peak memory usage: {memory_usage_mb():.0f}MB")
-    print("="*60)
+    print(f"\n🔧 Found {total_missing} missing resamples across {len([d for d, m in dataset_status.items() if m])} datasets")
+    print(f"⚡ Starting computation...\n")
     
-    return df, final_mean
+    return df, dataset_status
 
 
 def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_dir, 
                  n_resamples=Config.n_resamples):
-    """
-    Main evaluation function - uses memory-safe parallel processing.
-    """
-    return evaluate_all_memory_safe(folder, output_file, model_dir, n_resamples, Config.max_workers)
+    """Optimized evaluation with granular resample-level tracking."""
+    
+    resample_cols = [f"Resample_{i}" for i in range(1, n_resamples + 1)]
+    
+    # Load or initialize dataframe
+    if os.path.exists(output_file):
+        df = pd.read_csv(output_file)
+        print(f"📂 Loaded existing results: {len(df)} datasets")
+    else:
+        df = pd.DataFrame(columns=['Dataset'] + resample_cols + ['MeanAccuracy'])
+        print(f"📂 Creating new results file")
+    
+    # Check and identify ALL missing resamples
+    df, dataset_status = check_and_compute_missing(df, folder, model_dir, n_resamples)
+    
+    # Filter to only datasets with missing resamples
+    datasets_to_process = [d for d, missing in dataset_status.items() if missing]
+    
+    if not datasets_to_process:
+        print("\n🎉 Nothing to compute - all datasets complete!")
+        return df
+    
+    print(f"\n{'='*70}")
+    print(f"🚀 Processing {len(datasets_to_process)} datasets with missing resamples")
+    print(f"⚡ Using {Config.n_jobs} parallel threads")
+    print(f"{'='*70}\n")
+    
+    for dataset_idx, dataset in enumerate(datasets_to_process, 1):
+        missing_resamples = dataset_status[dataset]
+        
+        print(f"[{dataset_idx}/{len(datasets_to_process)}] 📊 Dataset: {dataset}")
+        print(f"   🎯 Computing {len(missing_resamples)} missing resamples: {missing_resamples}")
+        
+        for r in missing_resamples:
+            col = f"Resample_{r}"
+            
+            # Try loading from saved model first
+            model_file = os.path.join(model_dir, f"resample_{r}", dataset, "clf.pkl")
+            acc = None
+            
+            if os.path.exists(model_file):
+                try:
+                    model_data = joblib.load(model_file)
+                    acc = model_data.get('accuracy')
+                    if acc is not None:
+                        print(f"   📁 Resample {r}: Loaded from disk → {acc:.4f}")
+                except:
+                    pass
+            
+            # Compute if not available
+            if acc is None:
+                print(f"   ⚙️  Resample {r}: Computing...", end=' ', flush=True)
+                acc = process_resample(folder, dataset, r, model_dir)
+                print(f"✅ {acc:.4f}")
+            
+            # Update dataframe
+            df.loc[df['Dataset'] == dataset, col] = acc
+            
+            # Save checkpoint periodically
+            if missing_resamples.index(r) % Config.checkpoint_interval == 0 or r == missing_resamples[-1]:
+                # Recalculate mean accuracy
+                row = df[df['Dataset'] == dataset].iloc[0]
+                accuracies = [row[c] for c in resample_cols if not pd.isna(row[c])]
+                if accuracies:
+                    df.loc[df['Dataset'] == dataset, 'MeanAccuracy'] = np.mean(accuracies)
+                
+                df.to_csv(output_file, index=False)
+                print(f"   💾 Checkpoint saved")
+        
+        # Final mean calculation for this dataset
+        row = df[df['Dataset'] == dataset].iloc[0]
+        accuracies = [row[c] for c in resample_cols if not pd.isna(row[c])]
+        mean_acc = np.mean(accuracies) if accuracies else np.nan
+        df.loc[df['Dataset'] == dataset, 'MeanAccuracy'] = mean_acc
+        
+        print(f"   📈 Dataset complete! Mean accuracy: {mean_acc:.4f}")
+        print(f"   {'─'*65}\n")
+        
+        # Save after each dataset
+        df.to_csv(output_file, index=False)
+        gc.collect()
+    
+    # Final save and statistics
+    df.to_csv(output_file, index=False)
+    
+    print(f"\n{'='*70}")
+    print("✅ EVALUATION COMPLETE")
+    print(f"{'='*70}")
+    print(f"📊 Total datasets: {len(df)}")
+    print(f"🎯 Datasets processed: {len(datasets_to_process)}")
+    print(f"🔢 Total resamples computed: {sum(len(m) for m in dataset_status.values() if m)}")
+    
+    complete_datasets = df['MeanAccuracy'].notna().sum()
+    print(f"✓  Complete datasets: {complete_datasets}/{len(df)}")
+    
+    if complete_datasets > 0:
+        print(f"🏆 Overall mean accuracy: {df['MeanAccuracy'].mean():.4f}")
+    
+    print(f"💾 Results saved to: {output_file}")
+    final_mean = df['MeanAccuracy'].mean() if complete_datasets > 0 else None
+    return df, final_mean
 
 
 if __name__ == "__main__":
