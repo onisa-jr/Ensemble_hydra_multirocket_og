@@ -20,13 +20,13 @@ warnings.filterwarnings("ignore")
 class Config:
     """High-performance configuration"""
     n_resamples = 30
-    max_memory_mb = 45000  # Increased to match your 45GB RAM
+    max_memory_mb = 40000  # Increased to match your 45GB RAM
     skip_large_mb = 5000   # Increased threshold for large datasets
     skip_large_features = 20000  # Increased feature threshold
     output_file = "ucr_baseline_results_wide.csv"
     model_dir = "baseline_models_resamples"
     n_jobs = 9  # Utilize all 9 threads
-    chunk_size = 10000  # Process data in chunks for memory efficiency
+    chunk_size = 5000  # Process data in chunks for memory efficiency
 
 
 def memory_usage_mb():
