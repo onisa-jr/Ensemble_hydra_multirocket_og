@@ -5,28 +5,29 @@ import numpy as np
 import pandas as pd
 import joblib
 import warnings
-from tqdm.auto import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.linear_model import RidgeClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
 from aeon.transformations.collection.convolution_based import MultiRocket, HydraTransformer
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
-from pathlib import Path
 
 warnings.filterwarnings("ignore")
 
 
 class Config:
-    """High-performance configuration"""
+    """Central configuration for evaluation - Optimized for 50GB RAM, 9 threads"""
     n_resamples = 30
-    max_memory_mb = 40000  # Increased to match your 45GB RAM
-    skip_large_mb = 5000   # Increased threshold for large datasets
-    skip_large_features = 20000  # Increased feature threshold
+    max_workers = 9  # Full thread utilization
+    max_memory_mb = 40000  # 50GB available
+    skip_large_mb = 10000  # Increased threshold
+    skip_large_features = 50000  # Increased threshold
     output_file = "ucr_baseline_results_wide.csv"
     model_dir = "baseline_models_resamples"
-    n_jobs = 9  # Utilize all 9 threads
-    chunk_size = 5000  # Process data in chunks for memory efficiency
+    
+    # Performance optimizations
+    use_parallel = True  # Enable parallel processing
+    prefetch_datasets = True  # Load datasets in advance
+    aggressive_params = True  # Use maximum transformer parameters
 
 
 def memory_usage_mb():
@@ -34,16 +35,14 @@ def memory_usage_mb():
     return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
 
 
-def aggressive_cleanup():
-    """Aggressive garbage collection with memory pre-allocation hints."""
+def cleanup():
+    """Aggressive garbage collection."""
     gc.collect()
-    if hasattr(gc, 'freeze'):  # Python 3.10+
-        gc.freeze()
     gc.collect()
 
 
 def dataset_info(folder, name):
-    """Return (train_size_mb, test_size_mb, n_features) with caching."""
+    """Return (train_size_mb, test_size_mb, n_features)."""
     train_file = os.path.join(folder, name, f"{name}_TRAIN.tsv")
     test_file = os.path.join(folder, name, f"{name}_TEST.tsv")
 
@@ -51,175 +50,142 @@ def dataset_info(folder, name):
     test_size = os.path.getsize(test_file) / (1024 * 1024) if os.path.exists(test_file) else 0
 
     if train_size > 0:
-        # Use numpy for faster reading of just the first row
-        sample = np.loadtxt(train_file, delimiter='\t', max_rows=1)
-        n_features = sample.shape[0] - 1
+        sample = pd.read_csv(train_file, sep="\t", header=None, nrows=1)
+        n_features = sample.shape[1] - 1
     else:
         n_features = 0
 
     return train_size, test_size, n_features
 
 
-def optimize_data_loading(file_path, n_rows=None):
-    """Optimized data loading using numpy for better performance."""
-    data = np.loadtxt(file_path, delimiter='\t', max_rows=n_rows)
-    return data
-
-
-def fit_transformers_optimized(X_sample, n_features, size_mb, dataset_name):
-    """Optimized transformer fitting with memory-aware parameters."""
-    
-    # Memory-aware parameter tuning based on dataset size and available resources
-    if size_mb > 2000:
-        # Large datasets - conservative settings
-        multirocket = MultiRocket(n_kernels=800, n_jobs=2, random_state=42)
-        hydra = HydraTransformer(n_kernels=2, n_groups=4, random_state=42)
+def fit_transformers(X_sample, n_features, size_mb):
+    """
+    Fit Hydra and MultiRocket with scaling, optimized for high-resource machine.
+    Uses aggressive parameters to maximize quality and speed.
+    """
+    # With 50GB RAM, we can use much more aggressive parameters
+    if size_mb > 5000:
+        # Very large datasets - conservative but still aggressive
+        multirocket = MultiRocket(n_kernels=2000, n_jobs=-1, random_state=42)
+        hydra = HydraTransformer(n_kernels=4, n_groups=32, random_state=42)
+    elif size_mb > 1000:
+        # Large datasets - more aggressive
+        multirocket = MultiRocket(n_kernels=5000, n_jobs=-1, random_state=42)
+        hydra = HydraTransformer(n_kernels=8, n_groups=64, random_state=42)
     elif size_mb > 500:
-        # Medium datasets - balanced settings
-        multirocket = MultiRocket(n_kernels=2000, n_jobs=4, random_state=42)
-        hydra = HydraTransformer(n_kernels=4, n_groups=8, random_state=42)
+        # Medium datasets - very aggressive
+        multirocket = MultiRocket(n_kernels=10000, n_jobs=-1, random_state=42)
+        hydra = HydraTransformer(n_kernels=16, n_groups=128, random_state=42)
     else:
-        # Small datasets - aggressive settings
-        multirocket = MultiRocket(n_kernels=5000, n_jobs=8, random_state=42)
-        hydra = HydraTransformer(n_kernels=8, n_groups=16, random_state=42)
+        # Small datasets - maximum parameters
+        multirocket = MultiRocket(n_kernels=20000, n_jobs=-1, random_state=42)
+        hydra = HydraTransformer(n_kernels=32, n_groups=256, random_state=42)
 
-    # Use float32 to save memory
-    X_sample = X_sample.astype(np.float32)
-    
-    scaler_hydra = StandardScaler()
-    scaler_std = StandardScaler()
-    
-    # Process transformers in optimized order
+    scaler_std, scaler_hydra = StandardScaler(), StandardScaler()
     Xt_hydra = scaler_hydra.fit_transform(hydra.fit_transform(X_sample))
     Xt_multi = scaler_std.fit_transform(multirocket.fit_transform(X_sample))
-    
-    # Concatenate efficiently
-    features = np.concatenate([Xt_hydra, Xt_multi], axis=1, dtype=np.float32)
-    
+    features = np.concatenate([Xt_hydra, Xt_multi], axis=1)
+
     return multirocket, hydra, scaler_std, scaler_hydra, features
 
 
-def process_chunked_data(X_data, hydra, multirocket, scaler_hydra, scaler_std, chunk_size=1000):
-    """Process data in chunks to avoid memory issues."""
-    if len(X_data) <= chunk_size:
-        # Process all at once for smaller datasets
-        Xt_hydra = scaler_hydra.transform(hydra.transform(X_data))
-        Xt_multi = scaler_std.transform(multirocket.transform(X_data))
-        return np.concatenate([Xt_hydra, Xt_multi], axis=1, dtype=np.float32)
-    else:
-        # Chunk processing for memory efficiency
-        X_transformed = []
-        for i in range(0, len(X_data), chunk_size):
-            chunk = X_data[i:i + chunk_size]
-            Xt_hydra_chunk = scaler_hydra.transform(hydra.transform(chunk))
-            Xt_multi_chunk = scaler_std.transform(multirocket.transform(chunk))
-            chunk_features = np.concatenate([Xt_hydra_chunk, Xt_multi_chunk], axis=1, dtype=np.float32)
-            X_transformed.append(chunk_features)
-        return np.vstack(X_transformed)
-
-
-def process_dataset_optimized(folder, dataset, resample_id, model_dir):
-    """Highly optimized dataset processing."""
+def process_dataset_resample(args):
+    """
+    Process a single dataset-resample combination (for parallel execution).
+    
+    Args:
+        args: Tuple of (folder, dataset, resample_id, model_dir)
+    
+    Returns:
+        Tuple of (dataset, resample_id, accuracy)
+    """
+    folder, dataset, resample_id, model_dir = args
+    
     # Set random seed for reproducibility
     np.random.seed(resample_id)
 
-    # Optimized path handling
-    dataset_model_dir = Path(model_dir) / f"resample_{resample_id}" / dataset
-    model_file = dataset_model_dir / "clf.pkl"
+    # Setup model directory and check if model exists
+    dataset_model_dir = os.path.join(model_dir, dataset)
+    model_file = os.path.join(dataset_model_dir, "clf.pkl")
+    os.makedirs(dataset_model_dir, exist_ok=True)
     
-    # Skip if already processed
-    if model_file.exists():
-        return None
-
-    # Create directory efficiently
-    dataset_model_dir.mkdir(parents=True, exist_ok=True)
+    if os.path.exists(model_file):
+        return (dataset, resample_id, None)
 
     try:
-        # Optimized data loading
-        train_file = Path(folder) / dataset / f"{dataset}_TRAIN.tsv"
-        test_file = Path(folder) / dataset / f"{dataset}_TEST.tsv"
-        
-        # Load data with numpy for better performance
-        train_data = optimize_data_loading(train_file)
-        test_data = optimize_data_loading(test_file)
+        # Load train and test data
+        train_file = os.path.join(folder, dataset, f"{dataset}_TRAIN.tsv")
+        test_file = os.path.join(folder, dataset, f"{dataset}_TEST.tsv")
+        train_df = pd.read_csv(train_file, sep="\t", header=None)
+        test_df = pd.read_csv(test_file, sep="\t", header=None)
 
-        # Combine and shuffle efficiently
-        full_data = np.vstack([train_data, test_data])
-        rng = np.random.default_rng(resample_id)
-        rng.shuffle(full_data, axis=0)
+        # Combine and shuffle data
+        full_df = pd.concat([train_df, test_df], ignore_index=True)
+        full_df = full_df.sample(frac=1, random_state=resample_id).reset_index(drop=True)
 
-        # Split back
-        n_train = len(train_data)
-        train_data = full_data[:n_train]
-        test_data = full_data[n_train:n_train + len(test_data)]
+        # Split back into train and test sets
+        n_train, n_test = len(train_df), len(test_df)
+        train_df = full_df.iloc[:n_train].reset_index(drop=True)
+        test_df = full_df.iloc[n_train:n_train + n_test].reset_index(drop=True)
 
-        # Extract features and labels
-        y_train = train_data[:, 0].astype(np.int32)
-        X_train = train_data[:, 1:].astype(np.float32).reshape(len(train_data), 1, -1)
-        y_test = test_data[:, 0].astype(np.int32)
-        X_test = test_data[:, 1:].astype(np.float32).reshape(len(test_data), 1, -1)
+        # Prepare feature and label arrays
+        y_train = train_df.iloc[:, 0].values
+        X_train = train_df.iloc[:, 1:].values.reshape(train_df.shape[0], 1, train_df.shape[1] - 1)
+        y_test = test_df.iloc[:, 0].values
+        X_test = test_df.iloc[:, 1:].values.reshape(test_df.shape[0], 1, test_df.shape[1] - 1)
 
-        # Get dataset info for parameter tuning
+        # Fit transformers and classifier on a sample
         train_size, _, n_features = dataset_info(folder, dataset)
-        
-        # Use larger sample for better transformer fitting
-        sample_size = min(100, len(X_train))
-        multirocket, hydra, scaler_std, scaler_hydra, X_fit = fit_transformers_optimized(
-            X_train[:sample_size], n_features, train_size, dataset
+        multirocket, hydra, scaler_std, scaler_hydra, X_fit = fit_transformers(
+            X_train[:min(100, len(X_train))], n_features, train_size
         )
+        clf = RidgeClassifier().fit(X_fit, y_train[:min(100, len(X_train))])
 
-        # Initialize classifier with optimized parameters
-        clf = RidgeClassifier(alpha=1.0, solver='sparse_cg', random_state=42)
-        clf.fit(X_fit, y_train[:sample_size])
+        # Transform and train on full training data
+        Xt_hydra = scaler_hydra.transform(hydra.transform(X_train))
+        Xt_multi = scaler_std.transform(multirocket.transform(X_train))
+        clf.fit(np.concatenate([Xt_hydra, Xt_multi], axis=1), y_train)
 
-        # Process full training data with chunking
-        X_train_features = process_chunked_data(
-            X_train, hydra, multirocket, scaler_hydra, scaler_std, Config.chunk_size
-        )
+        # Transform and evaluate on test data
+        Xt_hydra = scaler_hydra.transform(hydra.transform(X_test))
+        Xt_multi = scaler_std.transform(multirocket.transform(X_test))
+        X_test_features = np.concatenate([Xt_hydra, Xt_multi], axis=1)
+        acc = accuracy_score(y_test, clf.predict(X_test_features))
 
-        # Fit final classifier
-        clf.fit(X_train_features, y_train)
-
-        # Transform test data with chunking
-        X_test_features = process_chunked_data(
-            X_test, hydra, multirocket, scaler_hydra, scaler_std, Config.chunk_size
-        )
-
-        # Predict and calculate accuracy
-        y_pred = clf.predict(X_test_features)
-        acc = accuracy_score(y_test, y_pred)
-
-        # Save model with compression
+        # Save model
         joblib.dump({
             "clf": clf,
             "hydra": hydra,
             "multirocket": multirocket,
             "scaler_std": scaler_std,
             "scaler_hydra": scaler_hydra
-        }, model_file, compress=3)  # Level 3 compression for speed/size balance
+        }, model_file)
 
-        return acc
+        # Cleanup
+        cleanup()
 
-    except Exception as e:
-        print(f"❌ Error processing {dataset} (resample {resample_id}): {str(e)}")
-        return None
-    finally:
-        aggressive_cleanup()
-
-
-def process_dataset_batch(datasets_batch, folder, resample_id, model_dir):
-    """Process a batch of datasets for a single resample."""
-    results = {}
-    for dataset in datasets_batch:
-        acc = process_dataset_optimized(folder, dataset, resample_id, model_dir)
-        results[dataset] = acc
-    return results
-
-
-def evaluate_all_parallel(folder, output_file=Config.output_file, 
-                         model_dir=Config.model_dir, n_resamples=Config.n_resamples):
-    """Highly parallel evaluation using all available cores."""
+        return (dataset, resample_id, acc)
     
+    except Exception as e:
+        print(f"❌ Error processing {dataset} resample {resample_id}: {str(e)}")
+        return (dataset, resample_id, np.nan)
+
+
+def process_dataset(folder, dataset, resample_id, model_dir):
+    """
+    Single-threaded version (for compatibility).
+    Wrapper around process_dataset_resample for non-parallel execution.
+    """
+    _, _, acc = process_dataset_resample((folder, dataset, resample_id, model_dir))
+    return acc
+
+
+def evaluate_all_parallel(folder, output_file=Config.output_file, model_dir=Config.model_dir, 
+                          n_resamples=Config.n_resamples, max_workers=Config.max_workers):
+    """
+    Parallel evaluation of all datasets with resampling.
+    Utilizes all available CPU cores for maximum speed.
+    """
     # Load or create results table
     if os.path.exists(output_file):
         df = pd.read_csv(output_file)
@@ -230,76 +196,107 @@ def evaluate_all_parallel(folder, output_file=Config.output_file,
         df, processed = pd.DataFrame(columns=cols), set()
         print(f"📂 Starting fresh run, output will be saved to {output_file}")
 
-    # Get all datasets sorted by size
+    # Get all datasets
     datasets = [d for d in os.listdir(folder) if os.path.isdir(os.path.join(folder, d))]
-    datasets.sort(key=lambda d: sum(dataset_info(folder, d)[:2]))
+    datasets = [d for d in datasets if d not in processed]
     
-    # Filter out already processed datasets
-    pending_datasets = [d for d in datasets if d not in processed]
-    
-    if not pending_datasets:
+    if not datasets:
         print("✅ All datasets already processed!")
-        return df, df["MeanAccuracy"].mean() if len(df) else None
+        return df, df["MeanAccuracy"].dropna().mean() if len(df) else None
 
-    print(f"🚀 Processing {len(pending_datasets)} datasets using {Config.n_jobs} parallel jobs")
+    # Sort datasets by size (smallest first for better scheduling)
+    datasets.sort(key=lambda d: sum(dataset_info(folder, d)[:2]))
 
-    # Process resamples in parallel - simpler approach
-    with ProcessPoolExecutor(max_workers=Config.n_jobs) as executor:
-        futures = []
+    print(f"🚀 Processing {len(datasets)} datasets with {max_workers} parallel workers")
+    print(f"💾 Available memory: {Config.max_memory_mb}MB")
+    print(f"🔧 Aggressive parameters: {Config.aggressive_params}")
+
+    # Create all tasks (dataset, resample combinations)
+    tasks = []
+    for dataset in datasets:
+        for r in range(1, n_resamples + 1):
+            resample_model_dir = os.path.join(model_dir, f"resample_{r}")
+            tasks.append((folder, dataset, r, resample_model_dir))
+
+    print(f"📋 Total tasks to process: {len(tasks)}")
+
+    # Process tasks in parallel
+    completed_tasks = 0
+    current_dataset = None
+    dataset_results = {}
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_task = {executor.submit(process_dataset_resample, task): task for task in tasks}
         
-        # Create tasks for all dataset-resample combinations
-        for resample_id in range(1, n_resamples + 1):
-            for dataset in pending_datasets:
-                future = executor.submit(process_dataset_optimized, folder, dataset, resample_id, model_dir)
-                futures.append((future, dataset, resample_id))
-
-        # Process completed futures
-        with tqdm(total=len(futures), desc="Processing datasets") as pbar:
-            for future, dataset, resample_id in futures:
-                try:
-                    acc = future.result()
-                    
-                    if acc is not None:
-                        # Update results dataframe
-                        if dataset in df["Dataset"].values:
-                            df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
-                        else:
-                            row = {"Dataset": dataset}
-                            row.update({f"Resample_{i+1}": np.nan for i in range(n_resamples)})
-                            row[f"Resample_{resample_id}"] = acc
-                            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-                        
-                        # Update mean accuracy
-                        resample_cols = [f"Resample_{i+1}" for i in range(n_resamples)]
-                        current_accs = df.loc[df["Dataset"] == dataset, resample_cols].values[0]
-                        mean_acc = np.nanmean(current_accs)
-                        df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = mean_acc
-                
-                except Exception as e:
-                    print(f"❌ Error processing {dataset} (resample {resample_id}): {str(e)}")
-                
-                # Save progress after each completion
+        # Process completed tasks
+        for future in as_completed(future_to_task):
+            dataset, resample_id, acc = future.result()
+            completed_tasks += 1
+            
+            # Initialize dataset results if needed
+            if dataset not in dataset_results:
+                dataset_results[dataset] = {}
+            
+            dataset_results[dataset][resample_id] = acc
+            
+            # Progress update
+            if dataset != current_dataset:
+                current_dataset = dataset
+                print(f"\n🔄 Processing: {dataset}")
+            
+            status = f"✅ {acc:.4f}" if acc is not None else "⚠️  Exists"
+            print(f"   Resample {resample_id}/{n_resamples}: {status} "
+                  f"[{completed_tasks}/{len(tasks)} total]")
+            
+            # Update and save results after each task
+            if dataset in df["Dataset"].values:
+                df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
+                resample_cols = [f"Resample_{i}" for i in range(1, n_resamples + 1)]
+                df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = \
+                    df.loc[df["Dataset"] == dataset, resample_cols].mean(axis=1, skipna=True).values[0]
+            else:
+                row = {"Dataset": dataset, **{f"Resample_{i}": np.nan for i in range(1, n_resamples + 1)},
+                       "MeanAccuracy": np.nan}
+                row[f"Resample_{resample_id}"] = acc
+                row["MeanAccuracy"] = acc if acc is not None else np.nan
+                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            
+            # Save every 10 tasks
+            if completed_tasks % 10 == 0:
                 df.to_csv(output_file, index=False)
-                pbar.update(1)
-
-    # Final cleanup and summary
-    aggressive_cleanup()
     
-    final_mean = df["MeanAccuracy"].mean() if len(df) else None
-    print("\n✅ All datasets complete")
+    # Final save
+    df.to_csv(output_file, index=False)
+    
+    # Calculate final statistics
+    final_mean = df["MeanAccuracy"].dropna().mean() if len(df) else None
+    print("\n" + "="*60)
+    print("✅ All datasets complete!")
     if final_mean is not None:
         print(f"🏆 Overall Mean Accuracy: {final_mean:.4f}")
     else:
         print("⚠️ No valid results")
-
+    print("="*60)
+    
+    cleanup()
     return df, final_mean
 
 
-# Alternative simpler version for debugging
-def evaluate_all(folder, output_file=Config.output_file, 
-                       model_dir=Config.model_dir, n_resamples=Config.n_resamples):
-    """Simpler sequential version for debugging."""
-    
+def evaluate_all(folder, output_file=Config.output_file, model_dir=Config.model_dir, 
+                 n_resamples=Config.n_resamples):
+    """
+    Main evaluation function - automatically uses parallel processing if enabled.
+    """
+    if Config.use_parallel:
+        return evaluate_all_parallel(folder, output_file, model_dir, n_resamples, Config.max_workers)
+    else:
+        # Original sequential implementation (kept for compatibility)
+        return evaluate_all_sequential(folder, output_file, model_dir, n_resamples)
+
+
+def evaluate_all_sequential(folder, output_file, model_dir, n_resamples):
+    """Original sequential evaluation (for compatibility)."""
     if os.path.exists(output_file):
         df = pd.read_csv(output_file)
         processed = set(df["Dataset"].tolist())
@@ -311,43 +308,50 @@ def evaluate_all(folder, output_file=Config.output_file,
 
     datasets = [d for d in os.listdir(folder) if os.path.isdir(os.path.join(folder, d))]
     datasets.sort(key=lambda d: sum(dataset_info(folder, d)[:2]))
-    pending_datasets = [d for d in datasets if d not in processed]
 
-    if not pending_datasets:
-        print("✅ All datasets already processed!")
-        return df, df["MeanAccuracy"].mean() if len(df) else None
+    print(f"🚀 Processing {len(datasets)} datasets sequentially")
 
-    print(f"🚀 Processing {len(pending_datasets)} datasets sequentially")
+    for dataset in datasets:
+        if dataset in processed:
+            print(f"⏭️  Skipping {dataset} (already processed)")
+            continue
 
-    for dataset in tqdm(pending_datasets, desc="Datasets"):
+        print(f"\n🔄 Dataset: {dataset}")
         res_accs = []
-        
-        for resample_id in range(1, n_resamples + 1):
-            acc = process_dataset_optimized(folder, dataset, resample_id, model_dir)
-            res_accs.append(acc if acc is not None else np.nan)
-            
-            # Update results
-            if dataset in df["Dataset"].values:
-                df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
-            else:
-                row = {"Dataset": dataset}
-                row.update({f"Resample_{i+1}": np.nan for i in range(n_resamples)})
-                row[f"Resample_{resample_id}"] = acc
-                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            
-            # Update mean
-            resample_cols = [f"Resample_{i+1}" for i in range(n_resamples)]
-            current_accs = df.loc[df["Dataset"] == dataset, resample_cols].values[0]
-            mean_acc = np.nanmean(current_accs)
-            df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = mean_acc
-            
-            # Save progress
-            df.to_csv(output_file, index=False)
-        
-        print(f"✅ {dataset}: {np.nanmean(res_accs):.4f}")
 
-    final_mean = df["MeanAccuracy"].mean() if len(df) else None
-    print(f"🏆 Overall Mean Accuracy: {final_mean:.4f}")
+        for r in range(1, n_resamples + 1):
+            print(f"   ▶️ Resample {r}/{n_resamples}")
+            acc = process_dataset(folder, dataset, r, os.path.join(model_dir, f"resample_{r}"))
+
+            if acc is not None:
+                print(f"      ✅ Accuracy: {acc:.4f}")
+            else:
+                print(f"      ⚠️ Skipped (model already exists)")
+
+            res_accs.append(acc if acc is not None else np.nan)
+
+            if dataset in df["Dataset"].values:
+                df.loc[df["Dataset"] == dataset, f"Resample_{r}"] = res_accs[-1]
+                df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = np.nanmean(res_accs)
+            else:
+                row = {"Dataset": dataset, **{f"Resample_{i + 1}": np.nan for i in range(n_resamples)},
+                       "MeanAccuracy": np.nan}
+                row[f"Resample_{r}"] = res_accs[-1]
+                row["MeanAccuracy"] = np.nanmean(res_accs)
+                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+            df.to_csv(output_file, index=False)
+
+        print(f"   📊 Finished {dataset} → Mean accuracy: {np.nanmean(res_accs):.4f}")
+        cleanup()
+
+    final_mean = df["MeanAccuracy"].dropna().mean() if len(df) else None
+    print("\n✅ All datasets complete")
+    if final_mean is not None:
+        print(f"🏆 Overall Mean Accuracy: {final_mean:.4f}")
+    else:
+        print("⚠️ No valid results")
+
     return df, final_mean
 
 
