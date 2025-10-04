@@ -99,9 +99,23 @@ def fit_transformers_optimized(X_sample, n_features, size_mb, dataset_name):
     return multirocket, hydra, scaler_std, scaler_hydra, features
 
 
-def process_dataset_parallel_wrapper(args):
-    """Wrapper for parallel processing."""
-    return process_dataset_optimized(*args)
+def process_chunked_data(X_data, hydra, multirocket, scaler_hydra, scaler_std, chunk_size=1000):
+    """Process data in chunks to avoid memory issues."""
+    if len(X_data) <= chunk_size:
+        # Process all at once for smaller datasets
+        Xt_hydra = scaler_hydra.transform(hydra.transform(X_data))
+        Xt_multi = scaler_std.transform(multirocket.transform(X_data))
+        return np.concatenate([Xt_hydra, Xt_multi], axis=1, dtype=np.float32)
+    else:
+        # Chunk processing for memory efficiency
+        X_transformed = []
+        for i in range(0, len(X_data), chunk_size):
+            chunk = X_data[i:i + chunk_size]
+            Xt_hydra_chunk = scaler_hydra.transform(hydra.transform(chunk))
+            Xt_multi_chunk = scaler_std.transform(multirocket.transform(chunk))
+            chunk_features = np.concatenate([Xt_hydra_chunk, Xt_multi_chunk], axis=1, dtype=np.float32)
+            X_transformed.append(chunk_features)
+        return np.vstack(X_transformed)
 
 
 def process_dataset_optimized(folder, dataset, resample_id, model_dir):
@@ -158,43 +172,18 @@ def process_dataset_optimized(folder, dataset, resample_id, model_dir):
         clf = RidgeClassifier(alpha=1.0, solver='sparse_cg', random_state=42)
         clf.fit(X_fit, y_train[:sample_size])
 
-        # Process full training data in chunks if large
-        if len(X_train) > 1000:
-            # Chunk processing for memory efficiency
-            chunk_size = Config.chunk_size
-            X_train_transformed = []
-            
-            for i in range(0, len(X_train), chunk_size):
-                chunk = X_train[i:i + chunk_size]
-                Xt_hydra_chunk = scaler_hydra.transform(hydra.transform(chunk))
-                Xt_multi_chunk = scaler_std.transform(multirocket.transform(chunk))
-                chunk_features = np.concatenate([Xt_hydra_chunk, Xt_multi_chunk], axis=1, dtype=np.float32)
-                X_train_transformed.append(chunk_features)
-                
-            X_train_features = np.vstack(X_train_transformed)
-        else:
-            # Process all at once for smaller datasets
-            Xt_hydra = scaler_hydra.transform(hydra.transform(X_train))
-            Xt_multi = scaler_std.transform(multirocket.transform(X_train))
-            X_train_features = np.concatenate([Xt_hydra, Xt_multi], axis=1, dtype=np.float32)
+        # Process full training data with chunking
+        X_train_features = process_chunked_data(
+            X_train, hydra, multirocket, scaler_hydra, scaler_std, Config.chunk_size
+        )
 
         # Fit final classifier
         clf.fit(X_train_features, y_train)
 
-        # Transform test data
-        if len(X_test) > 1000:
-            X_test_transformed = []
-            for i in range(0, len(X_test), chunk_size):
-                chunk = X_test[i:i + chunk_size]
-                Xt_hydra_chunk = scaler_hydra.transform(hydra.transform(chunk))
-                Xt_multi_chunk = scaler_std.transform(multirocket.transform(chunk))
-                chunk_features = np.concatenate([Xt_hydra_chunk, Xt_multi_chunk], axis=1, dtype=np.float32)
-                X_test_transformed.append(chunk_features)
-            X_test_features = np.vstack(X_test_transformed)
-        else:
-            Xt_hydra = scaler_hydra.transform(hydra.transform(X_test))
-            Xt_multi = scaler_std.transform(multirocket.transform(X_test))
-            X_test_features = np.concatenate([Xt_hydra, Xt_multi], axis=1, dtype=np.float32)
+        # Transform test data with chunking
+        X_test_features = process_chunked_data(
+            X_test, hydra, multirocket, scaler_hydra, scaler_std, Config.chunk_size
+        )
 
         # Predict and calculate accuracy
         y_pred = clf.predict(X_test_features)
@@ -227,7 +216,7 @@ def process_dataset_batch(datasets_batch, folder, resample_id, model_dir):
     return results
 
 
-def evaluate_all(folder, output_file=Config.output_file, 
+def evaluate_all_parallel(folder, output_file=Config.output_file, 
                          model_dir=Config.model_dir, n_resamples=Config.n_resamples):
     """Highly parallel evaluation using all available cores."""
     
@@ -254,51 +243,44 @@ def evaluate_all(folder, output_file=Config.output_file,
 
     print(f"🚀 Processing {len(pending_datasets)} datasets using {Config.n_jobs} parallel jobs")
 
-    # Process resamples in parallel
+    # Process resamples in parallel - simpler approach
     with ProcessPoolExecutor(max_workers=Config.n_jobs) as executor:
-        futures = {}
+        futures = []
         
+        # Create tasks for all dataset-resample combinations
         for resample_id in range(1, n_resamples + 1):
-            # Split datasets into batches for better load balancing
-            batch_size = max(1, len(pending_datasets) // (Config.n_jobs * 2))
-            dataset_batches = [pending_datasets[i:i + batch_size] 
-                             for i in range(0, len(pending_datasets), batch_size)]
-            
-            for batch in dataset_batches:
-                future = executor.submit(process_dataset_batch, batch, folder, resample_id, model_dir)
-                futures[future] = (resample_id, batch)
+            for dataset in pending_datasets:
+                future = executor.submit(process_dataset_optimized, folder, dataset, resample_id, model_dir)
+                futures.append((future, dataset, resample_id))
 
         # Process completed futures
         with tqdm(total=len(futures), desc="Processing datasets") as pbar:
-            for future in as_completed(futures):
-                resample_id, batch = futures[future]
+            for future, dataset, resample_id in futures:
                 try:
-                    batch_results = future.result()
+                    acc = future.result()
                     
-                    for dataset, acc in batch_results.items():
-                        if acc is not None:
-                            # Update results dataframe
-                            if dataset in df["Dataset"].values:
-                                df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
-                            else:
-                                row = {"Dataset": dataset}
-                                row.update({f"Resample_{i+1}": np.nan for i in range(n_resamples)})
-                                row[f"Resample_{resample_id}"] = acc
-                                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-                            
-                            # Update mean accuracy
-                            resample_cols = [f"Resample_{i+1}" for i in range(n_resamples)]
-                            current_accs = df.loc[df["Dataset"] == dataset, resample_cols].values[0]
-                            mean_acc = np.nanmean(current_accs)
-                            df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = mean_acc
-                    
-                    # Save progress after each batch
-                    df.to_csv(output_file, index=False)
-                    pbar.update(1)
-                    
+                    if acc is not None:
+                        # Update results dataframe
+                        if dataset in df["Dataset"].values:
+                            df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
+                        else:
+                            row = {"Dataset": dataset}
+                            row.update({f"Resample_{i+1}": np.nan for i in range(n_resamples)})
+                            row[f"Resample_{resample_id}"] = acc
+                            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+                        
+                        # Update mean accuracy
+                        resample_cols = [f"Resample_{i+1}" for i in range(n_resamples)]
+                        current_accs = df.loc[df["Dataset"] == dataset, resample_cols].values[0]
+                        mean_acc = np.nanmean(current_accs)
+                        df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = mean_acc
+                
                 except Exception as e:
-                    print(f"❌ Error in batch processing: {str(e)}")
-                    pbar.update(1)
+                    print(f"❌ Error processing {dataset} (resample {resample_id}): {str(e)}")
+                
+                # Save progress after each completion
+                df.to_csv(output_file, index=False)
+                pbar.update(1)
 
     # Final cleanup and summary
     aggressive_cleanup()
@@ -310,6 +292,62 @@ def evaluate_all(folder, output_file=Config.output_file,
     else:
         print("⚠️ No valid results")
 
+    return df, final_mean
+
+
+# Alternative simpler version for debugging
+def evaluate_all(folder, output_file=Config.output_file, 
+                       model_dir=Config.model_dir, n_resamples=Config.n_resamples):
+    """Simpler sequential version for debugging."""
+    
+    if os.path.exists(output_file):
+        df = pd.read_csv(output_file)
+        processed = set(df["Dataset"].tolist())
+        print(f"📂 Resuming from existing results: {len(processed)} datasets already done")
+    else:
+        cols = ["Dataset"] + [f"Resample_{i}" for i in range(1, n_resamples + 1)] + ["MeanAccuracy"]
+        df, processed = pd.DataFrame(columns=cols), set()
+        print(f"📂 Starting fresh run, output will be saved to {output_file}")
+
+    datasets = [d for d in os.listdir(folder) if os.path.isdir(os.path.join(folder, d))]
+    datasets.sort(key=lambda d: sum(dataset_info(folder, d)[:2]))
+    pending_datasets = [d for d in datasets if d not in processed]
+
+    if not pending_datasets:
+        print("✅ All datasets already processed!")
+        return df, df["MeanAccuracy"].mean() if len(df) else None
+
+    print(f"🚀 Processing {len(pending_datasets)} datasets sequentially")
+
+    for dataset in tqdm(pending_datasets, desc="Datasets"):
+        res_accs = []
+        
+        for resample_id in range(1, n_resamples + 1):
+            acc = process_dataset_optimized(folder, dataset, resample_id, model_dir)
+            res_accs.append(acc if acc is not None else np.nan)
+            
+            # Update results
+            if dataset in df["Dataset"].values:
+                df.loc[df["Dataset"] == dataset, f"Resample_{resample_id}"] = acc
+            else:
+                row = {"Dataset": dataset}
+                row.update({f"Resample_{i+1}": np.nan for i in range(n_resamples)})
+                row[f"Resample_{resample_id}"] = acc
+                df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+            
+            # Update mean
+            resample_cols = [f"Resample_{i+1}" for i in range(n_resamples)]
+            current_accs = df.loc[df["Dataset"] == dataset, resample_cols].values[0]
+            mean_acc = np.nanmean(current_accs)
+            df.loc[df["Dataset"] == dataset, "MeanAccuracy"] = mean_acc
+            
+            # Save progress
+            df.to_csv(output_file, index=False)
+        
+        print(f"✅ {dataset}: {np.nanmean(res_accs):.4f}")
+
+    final_mean = df["MeanAccuracy"].mean() if len(df) else None
+    print(f"🏆 Overall Mean Accuracy: {final_mean:.4f}")
     return df, final_mean
 
 
